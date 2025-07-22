@@ -1,0 +1,177 @@
+Aquí tieno la versión mejorada, con correcciones ortográficas, mejor redacción, mayor claridad y detalles adicionales:
+
+---
+
+**Análisis de Complejidad en Sustitución de Identificadores**
+
+Consideremos la siguiente secuencia de evaluaciones:
+
+```racket
+{with {x 3}
+      {with {y 4}
+            {with {z 5}
+                  {+ x {+ y z}}}}
+
+= {with {y 4}
+        {with {z 5}
+              {+ 3 {+ y z}}}}
+
+= {with {z 5}
+        {+ 3 {+ 4 z}}}
+
+= {+ 3 {+ 4 5}}
+```
+
+Observamos que para reducir la expresión a operaciones básicas de suma, se requieren tres sustituciones sucesivas, una por cada expresión `with`. Si consideramos que el tamaño del programa es `n` (medido en nodos del AST), cada sustitución implica recorrer el subárbol correspondiente una vez. Esto resulta en una complejidad temporal de **$O(n^2)$**, ya que en el peor caso cada sustitución podría procesar casi todo el AST.
+
+**Solución Propuesta: Repositorio de Sustituciones Diferidas (Entorno)**
+
+Para optimizar este proceso, implementamos un **repositorio de sustituciones diferidas** (entorno de evaluación). El enfoque consiste en:
+
+1. **Inicialización**: Comenzar con un repositorio vacío (sin sustituciones pendientes).
+2. **Registro diferido**: Al encontrar una expresión de sustitución (`with` o aplicación de función):
+   - Registrar el identificador y su valor asociado
+   - **Posponer** la sustitución física en el AST
+3. **Acceso bajo demanda**: Resolver los valores de los identificadores solo cuando se necesiten durante la evaluación
+
+**Implementación del Repositorio**
+
+Definimos el repositorio como un tipo algebraico con dos variantes:
+
+```racket
+(define-type DefrdSub
+    [mtSub]                      ; Repositorio vacío
+    [aSub (name symbol?)          ; Identificador
+          (value number?)         ; Valor asociado
+          (rest-ds DefrdSub?)])   ; Entorno padre (estructura anidada)
+```
+
+La función de búsqueda opera recursivamente:
+
+```racket
+;; lookup: symbol DefrdSub -> number
+(define (lookup name ds)
+    (match ds
+        [(mtSub) (error 'lookup "Identificador libre: ~a" name)]
+        [(aSub n v rest-ds) (if (symbol=? name n)
+                              v
+                              (lookup name rest-ds))]))
+```
+
+**Implementación del Intérprete con Entorno**
+
+El intérprete se modifica para aceptar tres parámetros:
+1. Expresión a evaluar (F1WAE)
+2. Definiciones de funciones (fun-defs)
+3. Repositorio de sustituciones (ds)
+
+```racket
+;; interp: F1WAE fun-defs DefrdSub -> number
+(define (interp expr fun-defs ds)
+    (match expr
+        [(num n) n]
+        [(id s) (lookup s ds)]  ; Resolución en entorno actual
+        [(add l r) (+ (interp l fun-defs ds) (interp r fun-defs ds))]
+        [(minus l r) (- (interp l fun-defs ds) (interp r fun-defs ds))]
+        [(with bound-id bound-expr body-expr)
+         (local [(define bound-value (interp bound-expr fun-defs ds))]
+             (interp body-expr
+                     fun-defs
+                     (aSub bound-id bound-value ds)))] ; Extiende entorno
+        [(app fun-name arg-expr)
+         (local [(define the-fun (lookup-fundef fun-name fun-defs))
+                 (define arg-value (interp arg-expr fun-defs ds))]
+             (interp (fundef-body the-fun)
+                     fun-defs
+                     (aSub (fundef-arg-name the-fun) arg-value ds)))]))
+```
+
+**Cambios Clave vs. Sustitución Tradicional:**
+| Constructo       | Enfoque tradicional          | Con entorno diferido         |
+|------------------|-----------------------------|------------------------------|
+| **Identificadores** | Error en identificadores libres | Búsqueda en entorno actual |
+| **`with`**       | Sustitución inmediata en cuerpo | Extensión del entorno       |
+| **`app`**        | Sustitución en cuerpo de función | Extensión del entorno       |
+
+**Problema Detectado: Cambio Inadvertido a Ámbito Dinámico**
+
+Consideremos este ejemplo crítico:
+
+```racket
+; Definición de función:
+(list (fundef 'f 'p (id 'n))) ; f toma un parámetro p, pero retorna n
+
+; Expresión a evaluar:
+{with {n 5} {f 10}}
+```
+
+**Comportamiento esperado (ámbito léxico/estático):**
+1. `n` es identificador libre en `f` (no definido en la función)
+2. Debe generar error: "Identificador libre: n"
+
+**Comportamiento actual (ámbito dinámico):**
+1. El `with` externo añade `n=5` al entorno
+2. Al evaluar `(f 10)`, el cuerpo `(id 'n)` busca en el entorno *actual* (que incluye `n=5`)
+3. Retorna incorrectamente `5`
+
+**Análisis de Ámbitos:**
+- **Ámbito léxico (estático):** 
+  - Los identificadores se resuelven según la estructura del código fuente
+  - El entorno de una función es el existente en su **definición**
+  - *Comportamiento deseado en la mayoría de lenguajes modernos*
+- **Ámbito dinámico:**
+  - Los identificadores se resuelven según el flujo de ejecución
+  - El entorno de una función es el existente en su **llamada**
+  - *Comportamiento actual de nuestra implementación*
+
+**Corrección: Manteniendo el Ámbito Léxico**
+
+El error está en cómo manejamos aplicaciones de funciones:
+
+```racket
+; Versión INCORRECTA (ámbito dinámico):
+[(app fun-name arg-expr)
+ (interp (fundef-body (lookup-fundef fun-name fun-defs))
+         fun-defs
+         (aSub param-name 
+               arg-value 
+               ds))]  ; ¡Aquí se hereda el entorno de llamada (ds)!
+```
+
+**Solución (ámbito léxico):**
+
+```racket
+; Versión CORRECTA:
+[(app fun-name arg-expr)
+ (local [(define the-fun (lookup-fundef fun-name fun-defs))
+         (define arg-value (interp arg-expr fun-defs ds))]
+     (interp (fundef-body the-fun)
+             fun-defs
+             (aSub (fundef-arg-name the-fun)
+                   arg-value
+                   (mtSub))))]  ; Entorno NUEVO (sin contexto de llamada)
+```
+
+**Consecuencias de la Corrección:**
+1. Las funciones solo ven:
+   - Sus parámetros formales
+   - Identificadores definidos en su ámbito léxico original
+2. Se aisla el entorno de ejecución de funciones
+3. Se mantiene la semántica estática original del lenguaje
+
+**¿Por qué no aplicar esto a `with`?**
+- Los bloques `with` deben poder acceder a identificadores externos:
+  ```racket
+  {with {x 5}        ; Entorno inicial: [x=5]
+    {with {y {+ x 2}} ; Requiere acceder a x del entorno exterior
+        {+ y 3}}}
+  ```
+- Al usar `(aSub ... ds)` en `with`, mantenemos la cadena de entornos anidados
+
+**Complejidad Resultante:**
+- Cada nodo del AST se procesa exactamente **una vez**
+- Las búsquedas en el entorno tienen complejidad $O(d)$ (profundidad de anidamiento)
+- **Complejidad total: $O(n \cdot d)$** 
+  - En programas con anidamiento razonable: $O(n)$ práctica
+  - Mejora significativa frente a $O(n^2)$ original
+
